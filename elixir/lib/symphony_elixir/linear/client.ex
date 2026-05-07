@@ -26,6 +26,24 @@ defmodule SymphonyElixir.Linear.Client do
         assignee {
           id
         }
+        parent {
+          id
+          identifier
+          state {
+            name
+          }
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            title
+            branchName
+            state {
+              name
+            }
+          }
+        }
         labels {
           nodes {
             name
@@ -70,6 +88,24 @@ defmodule SymphonyElixir.Linear.Client do
         url
         assignee {
           id
+        }
+        parent {
+          id
+          identifier
+          state {
+            name
+          }
+        }
+        children(first: $relationFirst) {
+          nodes {
+            id
+            identifier
+            title
+            branchName
+            state {
+              name
+            }
+          }
         }
         labels {
           nodes {
@@ -458,6 +494,8 @@ defmodule SymphonyElixir.Linear.Client do
       branch_name: issue["branchName"],
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
+      parent: extract_parent(issue),
+      children: extract_children(issue),
       blocked_by: extract_blockers(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
@@ -546,6 +584,32 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_labels(_), do: []
+
+  defp extract_parent(%{"parent" => %{} = parent}) do
+    %{
+      id: parent["id"],
+      identifier: parent["identifier"],
+      state: get_in(parent, ["state", "name"])
+    }
+  end
+
+  defp extract_parent(_), do: nil
+
+  defp extract_children(%{"children" => %{"nodes" => children}}) when is_list(children) do
+    children
+    |> Enum.map(fn child ->
+      %{
+        id: child["id"],
+        identifier: child["identifier"],
+        title: child["title"],
+        branch_name: child["branchName"],
+        state: get_in(child, ["state", "name"])
+      }
+    end)
+    |> Enum.reject(&(is_nil(&1.id) and is_nil(&1.identifier)))
+  end
+
+  defp extract_children(_), do: []
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do
