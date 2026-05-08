@@ -129,6 +129,42 @@ defmodule SymphonyElixir.CoordinatorV2Test do
     assert plan.delivery.persona_needed == false
   end
 
+  test "docs-only release flow smoke does not require preview persona seeding" do
+    issue = %Issue{
+      id: "parent-release-smoke",
+      identifier: "HB-220",
+      title: "[HB-OPS] exercise Production Approved release flow end to end",
+      labels: ["Agent Epic", "Ops", "MVP", "Difficulty: Easy"],
+      description: """
+      ## Context
+
+      The Symphony Production Approval Runner should be tested with a harmless docs-only flow.
+
+      ## Problem
+
+      Prove the path from Preview Ready to Production Approved to Done.
+
+      ## Scope
+
+      Make a tiny documentation-only change in `docs/SYMPHONY_RELEASE_FLOW.md`.
+
+      ## Out of Scope
+
+      - No app behavior changes.
+      - No database or Supabase changes.
+      - No Vercel configuration changes.
+      """
+    }
+
+    assert {:ok, plan} = CoordinatorPlan.from_issue(issue)
+
+    assert plan.mode == "single-worker"
+    assert [child] = plan.children
+    assert child.title =~ "HB-220 worker"
+    assert plan.delivery.persona == "not needed"
+    assert plan.delivery.persona_needed == false
+  end
+
   test "vercel preview badge frontend fix does not trigger preview environment plan" do
     issue = %Issue{
       id: "parent-preview-badge",

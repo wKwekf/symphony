@@ -453,11 +453,41 @@ defmodule SymphonyElixir.CoordinatorPlan do
     labels = normalized_labels(issue)
     body = String.downcase("#{issue.title || ""}\n#{issue.description || ""}")
 
-    Enum.any?(labels, &(&1 in ["frontend", "backend", "feature", "bug"])) or
-      String.contains?(body, "preview") or
-      String.contains?(body, "persona") or
-      String.contains?(body, "ui") or
-      String.contains?(body, "daten")
+    cond do
+      docs_only_issue?(issue) ->
+        false
+
+      Enum.any?(labels, &(&1 in ["frontend", "backend", "feature", "bug"])) ->
+        true
+
+      true ->
+        String.contains?(body, "preview") or
+          String.contains?(body, "persona") or
+          String.contains?(body, "ui") or
+          String.contains?(body, "daten")
+    end
+  end
+
+  defp docs_only_issue?(%Issue{} = issue) do
+    labels = normalized_labels(issue)
+    body = String.downcase("#{issue.title || ""}\n#{issue.description || ""}")
+
+    Enum.any?(labels, &(&1 in ["docs", "documentation"])) or
+      Enum.any?(
+        [
+          "docs-only",
+          "docs only",
+          "documentation-only",
+          "documentation only",
+          "pure documentation",
+          "docs-only change",
+          "documentation-only change",
+          "no app behavior changes",
+          "no application behavior changes",
+          "no runtime behavior changes"
+        ],
+        &String.contains?(body, &1)
+      )
   end
 
   defp persona_seed_needed?(%Issue{} = issue, ui_or_data?) do
