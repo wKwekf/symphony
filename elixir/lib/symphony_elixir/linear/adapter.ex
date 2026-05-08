@@ -81,8 +81,8 @@ defmodule SymphonyElixir.Linear.Adapter do
   """
 
   @label_lookup_query """
-  query SymphonyLabelLookup($names: [String!]!) {
-    issueLabels(filter: {name: {in: $names}}, first: 100) {
+  query SymphonyLabelLookup {
+    issueLabels(first: 250) {
       nodes {
         id
         name
@@ -189,7 +189,7 @@ defmodule SymphonyElixir.Linear.Adapter do
         if Map.has_key?(acc, name) do
           {:cont, {:ok, acc}}
         else
-          case create_label(team_id, name) do
+          case create_or_lookup_label(team_id, name) do
             {:ok, label_id} -> {:cont, {:ok, Map.put(acc, name, label_id)}}
             {:error, reason} -> {:halt, {:error, reason}}
           end
@@ -324,17 +324,38 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp lookup_labels([]), do: {:ok, %{}}
 
   defp lookup_labels(names) do
-    with {:ok, response} <- client_module().graphql(@label_lookup_query, %{names: names}),
+    wanted_names_by_key =
+      names
+      |> normalize_label_names()
+      |> Map.new(fn name -> {normalize_label_key(name), name} end)
+
+    with {:ok, response} <- client_module().graphql(@label_lookup_query, %{}),
          labels when is_list(labels) <- get_in(response, ["data", "issueLabels", "nodes"]) do
       {:ok,
-       Map.new(labels, fn label ->
-         {label["name"], label["id"]}
+       Enum.reduce(labels, %{}, fn label, acc ->
+         label_key = normalize_label_key(label["name"])
+         requested_name = Map.get(wanted_names_by_key, label_key)
+         label_id = label["id"]
+
+         if is_binary(requested_name) and is_binary(label_id) do
+           Map.put_new(acc, requested_name, label_id)
+         else
+           acc
+         end
        end)}
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :label_lookup_failed}
     end
   end
+
+  defp normalize_label_key(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_label_key(value), do: value |> to_string() |> normalize_label_key()
 
   defp create_label(team_id, name) do
     with {:ok, response} <- client_module().graphql(@label_create_mutation, %{teamId: team_id, name: name}),
@@ -345,6 +366,23 @@ defmodule SymphonyElixir.Linear.Adapter do
       false -> {:error, :label_create_failed}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :label_create_failed}
+    end
+  end
+
+  defp create_or_lookup_label(team_id, name) do
+    case create_label(team_id, name) do
+      {:ok, label_id} ->
+        {:ok, label_id}
+
+      {:error, :label_create_failed} ->
+        case lookup_labels([name]) do
+          {:ok, %{^name => label_id}} when is_binary(label_id) -> {:ok, label_id}
+          {:ok, _labels} -> {:error, :label_create_failed}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

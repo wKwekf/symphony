@@ -9,7 +9,8 @@ defmodule SymphonyElixir.CoordinatorPlan do
 
   alias SymphonyElixir.Linear.Issue
 
-  @default_child_labels ["Agent Worker", "Agent Ready", "Difficulty: Standard"]
+  @base_child_labels ["Agent Worker", "Agent Ready"]
+  @default_difficulty_label "Difficulty: Standard"
 
   @type child_spec :: %{
           required(:title) => String.t(),
@@ -177,6 +178,7 @@ defmodule SymphonyElixir.CoordinatorPlan do
 
   defp single_worker_plan(%Issue{} = issue) do
     ui_or_data = ui_or_data_issue?(issue)
+    persona_needed = persona_seed_needed?(issue, ui_or_data)
 
     %{
       mode: "single-worker",
@@ -196,7 +198,7 @@ defmodule SymphonyElixir.CoordinatorPlan do
             "If validation cannot be run, explain why in the worker handoff."
           ],
           ownership_area: inferred_area(issue),
-          labels: Enum.uniq(@default_child_labels ++ inferred_area_labels(issue)),
+          labels: child_labels(issue, inferred_area_labels(issue)),
           risk: inferred_risk(issue),
           dependencies: []
         }
@@ -204,7 +206,7 @@ defmodule SymphonyElixir.CoordinatorPlan do
       delivery: %{
         review_surface: "Vercel Preview",
         persona: if(ui_or_data, do: "staff or relevant /dev/personas entry", else: "not needed"),
-        persona_needed: ui_or_data,
+        persona_needed: persona_needed,
         validation_expectations: ["Coordinator integrates child branch and publishes one draft PR/Preview."],
         changelog_impact: "yes if product behavior changed; no for docs-only work",
         steps_to_test: ["Open the Preview URL.", "Follow the parent issue review steps."]
@@ -247,7 +249,7 @@ defmodule SymphonyElixir.CoordinatorPlan do
             "If external credentials are required, document the exact unrun command and expected pass condition."
           ],
           ownership_area: "Backend",
-          labels: Enum.uniq(@default_child_labels ++ area_labels ++ ["Backend"]),
+          labels: child_labels(issue, area_labels ++ ["Backend"]),
           risk: "medium",
           dependencies: []
         },
@@ -312,11 +314,10 @@ defmodule SymphonyElixir.CoordinatorPlan do
   defp normalize_children(_children, issue), do: fallback_plan(issue).children
 
   defp normalize_child(child, issue, index) do
-    labels =
+    requested_labels =
       child
       |> get_value("labels", :labels, [])
       |> normalize_string_list()
-      |> then(&Enum.uniq(@default_child_labels ++ &1))
 
     %{
       title: get_string(child, "title", :title, "#{child_title(issue)} #{index}"),
@@ -331,7 +332,7 @@ defmodule SymphonyElixir.CoordinatorPlan do
         |> get_value("test_plan", :test_plan, [])
         |> normalize_string_list(["Run relevant focused validation or explain why not run."]),
       ownership_area: get_string(child, "ownership_area", :ownership_area, inferred_area(issue)),
-      labels: labels,
+      labels: child_labels(issue, requested_labels),
       risk: get_string(child, "risk", :risk, inferred_risk(issue)),
       dependencies:
         child
@@ -401,6 +402,43 @@ defmodule SymphonyElixir.CoordinatorPlan do
     end
   end
 
+  defp child_labels(%Issue{} = issue, extra_labels) when is_list(extra_labels) do
+    difficulty_label =
+      Enum.find(extra_labels, &difficulty_label?/1) ||
+        inherited_difficulty_label(issue)
+
+    extra_without_difficulty = Enum.reject(extra_labels, &difficulty_label?/1)
+
+    Enum.uniq(@base_child_labels ++ [difficulty_label] ++ extra_without_difficulty)
+  end
+
+  defp inherited_difficulty_label(%Issue{} = issue) do
+    issue.labels
+    |> Kernel.||([])
+    |> Enum.find(&difficulty_label?/1)
+    |> canonical_difficulty_label()
+    |> Kernel.||(@default_difficulty_label)
+  end
+
+  defp difficulty_label?(label) do
+    label
+    |> to_string()
+    |> String.downcase()
+    |> String.starts_with?("difficulty:")
+  end
+
+  defp canonical_difficulty_label(nil), do: nil
+
+  defp canonical_difficulty_label(label) do
+    case label |> to_string() |> String.trim() |> String.downcase() do
+      "difficulty: easy" -> "Difficulty: Easy"
+      "difficulty: standard" -> "Difficulty: Standard"
+      "difficulty: hard" -> "Difficulty: Hard"
+      "difficulty: critical" -> "Difficulty: Critical"
+      _ -> label
+    end
+  end
+
   defp inferred_risk(%Issue{} = issue) do
     labels = normalized_labels(issue)
 
@@ -422,11 +460,34 @@ defmodule SymphonyElixir.CoordinatorPlan do
       String.contains?(body, "daten")
   end
 
+  defp persona_seed_needed?(%Issue{} = issue, ui_or_data?) do
+    ui_or_data? and not persona_seeding_explicitly_out_of_scope?(issue)
+  end
+
+  defp persona_seeding_explicitly_out_of_scope?(%Issue{} = issue) do
+    body = String.downcase("#{issue.title || ""}\n#{issue.description || ""}")
+
+    Enum.any?(
+      [
+        "no auth or persona seeding changes",
+        "no persona seeding changes",
+        "no seeding changes",
+        "no seed changes",
+        "without changing auth, seeding",
+        "without changing seeding",
+        "do not seed",
+        "do not run seed",
+        "do not require seed",
+        "no seeded data changes"
+      ],
+      &String.contains?(body, &1)
+    )
+  end
+
   defp preview_environment_issue?(%Issue{} = issue) do
     body = primary_issue_body(issue)
 
-    String.contains?(body, "preview") and
-      Enum.any?(["seed", "persona", "supabase", "vercel", "environment", "umgebung"], &String.contains?(body, &1))
+    explicit_preview_environment_issue?(body)
   end
 
   defp primary_issue_body(%Issue{} = issue) do
@@ -439,10 +500,51 @@ defmodule SymphonyElixir.CoordinatorPlan do
         parts: 2
       )
       |> List.first()
+      |> then(fn primary ->
+        primary
+        |> to_string()
+        |> String.split(~r/\n##\s+Out of Scope\b/i, parts: 2)
+        |> List.first()
+      end)
 
     "#{title}\n#{primary_description || ""}"
     |> String.downcase()
   end
+
+  defp explicit_preview_environment_issue?(body) when is_binary(body) do
+    String.contains?(body, "preview") and
+      Enum.any?(
+        [
+          "preview environment",
+          "preview environments",
+          "preview umgebung",
+          "preview umgebungen",
+          "review environment",
+          "review environments",
+          "review umgebung",
+          "review umgebungen",
+          "preview branch",
+          "preview branches",
+          "branch-ref",
+          "automatic branching",
+          "supabase preview",
+          "preview api",
+          "preview seed",
+          "preview seeding",
+          "seed preview",
+          "seed:preview",
+          "seeded preview",
+          "seeded personas",
+          "seeded /dev/personas",
+          "preview persona seeding",
+          "service-role",
+          "service role"
+        ],
+        &String.contains?(body, &1)
+      )
+  end
+
+  defp explicit_preview_environment_issue?(_body), do: false
 
   defp normalized_labels(%Issue{labels: labels}) when is_list(labels) do
     Enum.map(labels, &String.downcase(to_string(&1)))

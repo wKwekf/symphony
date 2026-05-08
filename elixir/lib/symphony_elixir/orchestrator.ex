@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{Config, CoordinatorRunner, StatusDashboard, Tracker, WorkerRunner, Workspace}
+  alias SymphonyElixir.{Config, CoordinatorRunner, ReleaseRunner, StatusDashboard, Tracker, WorkerRunner, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -316,7 +316,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec runner_type_for_issue_for_test(Issue.t()) :: :coordinator | :worker
+  @spec runner_type_for_issue_for_test(Issue.t()) :: :coordinator | :release | :worker
   def runner_type_for_issue_for_test(%Issue{} = issue) do
     runner_type_for_issue(issue)
   end
@@ -771,13 +771,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_dispatchable_by_labels?(%Issue{} = issue) do
     labels = issue_label_set(issue)
+    state = normalize_issue_state(issue.state || "")
 
     cond do
+      release_candidate_label_set?(labels) ->
+        state == "in review" and
+          MapSet.disjoint?(labels, MapSet.new(["needs shaping", "coordinator required"])) and
+          !MapSet.member?(labels, "production deployed")
+
       !MapSet.disjoint?(labels, @hold_labels) -> false
-      MapSet.member?(labels, "agent epic") -> true
-      MapSet.member?(labels, "agent ready") -> true
+      MapSet.member?(labels, "agent epic") -> state != "in review" and !MapSet.member?(labels, "preview ready")
+      MapSet.member?(labels, "agent ready") -> state != "in review"
       MapSet.member?(labels, "agent worker") -> false
-      true -> true
+      true -> state != "in review"
     end
   end
 
@@ -896,15 +902,31 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp runner_type_for_issue(%Issue{} = issue) do
-    if MapSet.member?(issue_label_set(issue), "agent epic"), do: :coordinator, else: :worker
+    labels = issue_label_set(issue)
+
+    cond do
+      release_candidate_label_set?(labels) -> :release
+      MapSet.member?(labels, "agent epic") -> :coordinator
+      true -> :worker
+    end
   end
 
   defp run_issue_with_runner(:coordinator, %Issue{} = issue, recipient, opts) do
     CoordinatorRunner.run(issue, recipient, opts)
   end
 
+  defp run_issue_with_runner(:release, %Issue{} = issue, recipient, opts) do
+    ReleaseRunner.run(issue, recipient, opts)
+  end
+
   defp run_issue_with_runner(:worker, %Issue{} = issue, recipient, opts) do
     WorkerRunner.run(issue, recipient, opts)
+  end
+
+  defp release_candidate_label_set?(labels) do
+    MapSet.member?(labels, "agent epic") and
+      MapSet.member?(labels, "preview ready") and
+      MapSet.member?(labels, "production approved")
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)

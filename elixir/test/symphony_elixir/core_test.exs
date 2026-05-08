@@ -212,7 +212,10 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "SymphonyElixir.start_link delegates to the orchestrator" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"]
+    )
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
     orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
 
@@ -530,7 +533,10 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "agent labels gate dispatch and select coordinator or worker runner" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"]
+    )
 
     state = %Orchestrator.State{
       running: %{},
@@ -562,6 +568,22 @@ defmodule SymphonyElixir.CoreTest do
       labels: ["Agent Epic", "Needs Shaping"]
     }
 
+    release = %Issue{
+      id: "issue-release",
+      identifier: "HB-RELEASE",
+      title: "Release approved parent",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready", "Production Approved", "Human Review Required"]
+    }
+
+    preview_only = %Issue{
+      id: "issue-preview-only",
+      identifier: "HB-PREVIEW",
+      title: "Preview only parent",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready"]
+    }
+
     worker_only = %Issue{
       id: "issue-worker-only",
       identifier: "HB-WORKER-ONLY",
@@ -576,7 +598,11 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.should_dispatch_issue_for_test(child, state)
     assert Orchestrator.runner_type_for_issue_for_test(child) == :worker
 
+    assert Orchestrator.should_dispatch_issue_for_test(release, state)
+    assert Orchestrator.runner_type_for_issue_for_test(release) == :release
+
     refute Orchestrator.should_dispatch_issue_for_test(held, state)
+    refute Orchestrator.should_dispatch_issue_for_test(preview_only, state)
     refute Orchestrator.should_dispatch_issue_for_test(worker_only, state)
   end
 

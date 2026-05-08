@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.CoordinatorV2Test do
   use SymphonyElixir.TestSupport
 
-  alias SymphonyElixir.{CoordinatorPlan, CoordinatorRunner, DeliveryRunner}
+  alias SymphonyElixir.{CoordinatorPlan, CoordinatorRunner, DeliveryRunner, ReleaseRunner}
 
   test "fallback coordinator plan creates one worker child contract" do
     issue = %Issue{
@@ -20,6 +20,7 @@ defmodule SymphonyElixir.CoordinatorV2Test do
     assert child.title =~ "HB-999 worker"
     assert "Agent Worker" in child.labels
     assert "Agent Ready" in child.labels
+    assert "Difficulty: Standard" in child.labels
     assert child.ownership_area == "Frontend"
     assert plan.delivery.review_surface == "Vercel Preview"
   end
@@ -81,6 +82,89 @@ defmodule SymphonyElixir.CoordinatorV2Test do
 
     assert plan.mode == "single-worker"
     assert [child] = plan.children
+    refute String.contains?(child.title, "preview seed command")
+    refute String.contains?(child.scope, "Own only the preview persona seeding path")
+    assert child.ownership_area == "Frontend"
+  end
+
+  test "dev personas smoke marker does not trigger preview environment plan" do
+    issue = %Issue{
+      id: "parent-smoke-marker",
+      identifier: "HB-210",
+      title: "[HB-FRONTEND] add dev personas smoke marker",
+      labels: ["Agent Epic", "Frontend", "MVP", "Feature", "Difficulty: Easy"],
+      description: """
+      ## Context
+
+      We need a tiny, low-risk end-to-end smoke test for the Symphony v2 coordinator flow.
+
+      ## Problem
+
+      Daniel needs confidence that the default flow works without manual terminal orchestration.
+
+      ## Scope
+
+      Add a very small, unobtrusive smoke-test marker to the existing `/dev/personas` page.
+      The marker should be visible in Preview/dev persona mode.
+
+      ## Out of Scope
+
+      - No Supabase migrations.
+      - No auth or persona seeding changes.
+      - No production deployment.
+      """
+    }
+
+    assert {:ok, plan} = CoordinatorPlan.from_issue(issue)
+
+    assert plan.mode == "single-worker"
+    assert [child] = plan.children
+    assert child.title =~ "HB-210 worker"
+    assert "Difficulty: Easy" in child.labels
+    assert child.scope =~ "smoke-test marker"
+    refute String.contains?(child.title, "preview seed command")
+    refute String.contains?(child.scope, "Own only the preview persona seeding path")
+    assert child.ownership_area == "Frontend"
+    assert plan.delivery.persona == "staff or relevant /dev/personas entry"
+    assert plan.delivery.persona_needed == false
+  end
+
+  test "vercel preview badge frontend fix does not trigger preview environment plan" do
+    issue = %Issue{
+      id: "parent-preview-badge",
+      identifier: "HB-214",
+      title: "[HB-FRONTEND] show Preview badge on Vercel preview deployments",
+      labels: ["Agent Epic", "Frontend", "MVP", "Bug", "Difficulty: Easy"],
+      description: """
+      ## Context
+
+      A Vercel Preview deployment loaded correctly, but the global environment badge
+      at the bottom-left still displayed `STAGING`.
+
+      ## Problem
+
+      Preview links need to be visually trustworthy.
+
+      ## Scope
+
+      Fix the environment indicator so Vercel Preview deployments display `PREVIEW`
+      instead of `STAGING`.
+
+      Expected implementation surface:
+
+      - Locate the global environment badge/indicator logic in the portal frontend.
+      - Ensure Vercel preview deployments are detected reliably.
+      - Keep Staging and Production behavior unchanged.
+      """
+    }
+
+    assert {:ok, plan} = CoordinatorPlan.from_issue(issue)
+
+    assert plan.mode == "single-worker"
+    assert [child] = plan.children
+    assert child.title =~ "HB-214 worker"
+    assert "Difficulty: Easy" in child.labels
+    assert child.scope =~ "environment indicator"
     refute String.contains?(child.title, "preview seed command")
     refute String.contains?(child.scope, "Own only the preview persona seeding path")
     assert child.ownership_area == "Frontend"
@@ -331,5 +415,81 @@ defmodule SymphonyElixir.CoordinatorV2Test do
 
     assert {:error, reason} = DeliveryRunner.preview_api_url_for_test()
     assert reason =~ "Refusing to seed via the Vercel Preview app URL"
+  end
+
+  test "release runner allows human-review approved preview parents" do
+    parent = %Issue{
+      id: "parent-release",
+      identifier: "HB-300",
+      title: "Release preview",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready", "Production Approved", "Human Review Required"]
+    }
+
+    assert :ok = ReleaseRunner.validate_release_candidate_for_test(parent)
+  end
+
+  test "release runner blocks high-risk unattended production" do
+    parent = %Issue{
+      id: "parent-risk",
+      identifier: "HB-301",
+      title: "Release risky preview",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready", "Production Approved", "Migration"]
+    }
+
+    assert {:blocked, reason} = ReleaseRunner.validate_release_candidate_for_test(parent)
+    assert reason =~ "high-risk"
+  end
+
+  test "release runner parses script output contract" do
+    output =
+      "Status: production-ready\n" <>
+        "PR: https://github.com/wKwekf/hirebase/pull/999\n" <>
+        "Commit: abc123\n" <>
+        "Production: https://app.wolfrecruitment.net\n" <>
+        "Deployment: dpl_test\n"
+
+    release = ReleaseRunner.parse_release_output_for_test(output, 0)
+
+    assert release.status == "production-ready"
+    assert release.pr_url == "https://github.com/wKwekf/hirebase/pull/999"
+    assert release.commit_sha == "abc123"
+    assert release.production_url == "https://app.wolfrecruitment.net"
+    assert release.deployment_id == "dpl_test"
+  end
+
+  test "release runner marks production deployed after successful command" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    previous_command = System.get_env("SYMPHONY_RELEASE_COMMAND")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_RELEASE_COMMAND", previous_command)
+    end)
+
+    System.put_env(
+      "SYMPHONY_RELEASE_COMMAND",
+      "printf 'Status: production-ready\\nPR: https://github.com/wKwekf/hirebase/pull/999\\nCommit: abc123\\nProduction: https://app.wolfrecruitment.net\\nDeployment: dpl_test\\n'"
+    )
+
+    parent = %Issue{
+      id: "parent-release-success",
+      identifier: "HB-302",
+      title: "Release preview",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready", "Production Approved"]
+    }
+
+    assert :ok = ReleaseRunner.run(parent)
+
+    assert_receive {:memory_tracker_labels_ensured, labels}
+    assert "Production Approved" in labels
+    assert_receive {:memory_tracker_labels_added, "parent-release-success", ["Production Deployed"]}
+    assert_receive {:memory_tracker_comment, "parent-release-success", comment}
+    assert comment =~ "Production Release Summary"
+    assert comment =~ "abc123"
+    assert_receive {:memory_tracker_state_update, "parent-release-success", "Done"}
   end
 end

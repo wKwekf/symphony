@@ -100,7 +100,7 @@ defmodule SymphonyElixir.CoordinatorRunner do
     errors =
       Enum.flat_map(results, fn
         {_child, {:ok, _issue}} -> []
-        {child, {:error, reason}} -> ["#{child.title}: #{inspect(reason)}"]
+        {child, {:error, reason}} -> [{child, reason}]
       end)
 
     if errors == [] do
@@ -135,9 +135,44 @@ defmodule SymphonyElixir.CoordinatorRunner do
       create_comment(issue, comment)
       :ok
     else
-      block_parent(issue, "Coordinator could not create all child issues:\n#{Enum.join(errors, "\n")}")
+      if Enum.all?(errors, &transient_child_create_error?/1) do
+        retry_child_creation_later(issue, errors)
+      else
+        block_parent(issue, "Coordinator could not create all child issues:\n#{format_child_create_errors(errors)}")
+      end
     end
   end
+
+  defp retry_child_creation_later(%Issue{} = issue, errors) do
+    comment = """
+    ## Symphony Coordinator Retry
+
+    Parent: #{issue.identifier || issue.id} / #{issue.title}
+    Result: Coordinator hit a transient Linear API error while creating child issues.
+    Reason:
+    #{format_child_create_errors(errors)}
+
+    Action: leaving the parent active so the next Symphony poll can retry automatically.
+    Decision needed: coordinator
+    """
+
+    create_comment(issue, comment)
+    ensure_parent_in_progress(issue)
+    :ok
+  end
+
+  defp format_child_create_errors(errors) do
+    Enum.map_join(errors, "\n", fn {child, reason} ->
+      "#{child.title}: #{inspect(reason)}"
+    end)
+  end
+
+  defp transient_child_create_error?({_child, reason}), do: transient_error?(reason)
+
+  defp transient_error?({:linear_api_request, %Req.TransportError{reason: :timeout}}), do: true
+  defp transient_error?({:linear_api_request, %{reason: :timeout}}), do: true
+  defp transient_error?({:linear_api_request, :timeout}), do: true
+  defp transient_error?(_reason), do: false
 
   defp clarify(%Issue{} = issue, questions) do
     comment = """
