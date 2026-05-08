@@ -280,6 +280,27 @@ defmodule SymphonyElixir.CoordinatorV2Test do
     assert_receive {:memory_tracker_state_update, "parent-canceled-child", "In Review"}
   end
 
+  test "delivery ignores Linear suggested branch names and lets local worktree branch win" do
+    parent = %Issue{
+      id: "parent-branch",
+      identifier: "HB-206",
+      title: "Deliver parent",
+      state: "In Progress",
+      labels: ["Agent Epic"],
+      children: [
+        %{id: "child-branch", identifier: "HB-209", state: "In Review", branch_name: "daniel/hb-209-linear-suggested"},
+        %{id: "child-codex", identifier: "HB-210", state: "In Review", branch_name: "codex/hb-210-agent"}
+      ]
+    }
+
+    assert {:ok, [linear_suggested, codex_branch]} = DeliveryRunner.child_specs_for_test(parent)
+
+    assert linear_suggested.identifier == "HB-209"
+    assert linear_suggested.branch == nil
+    assert codex_branch.identifier == "HB-210"
+    assert codex_branch.branch == "codex/hb-210-agent"
+  end
+
   test "delivery preview API URL uses Supabase ref instead of Vercel preview URL" do
     previous_api_url = System.get_env("SYMPHONY_PREVIEW_API_URL")
     previous_ref = System.get_env("SYMPHONY_PREVIEW_SUPABASE_REF")

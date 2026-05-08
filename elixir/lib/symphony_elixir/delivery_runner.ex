@@ -33,6 +33,9 @@ defmodule SymphonyElixir.DeliveryRunner do
     end
   end
 
+  @doc false
+  def child_specs_for_test(%Issue{} = parent), do: child_specs(parent)
+
   defp child_specs(%Issue{children: children}) when is_list(children) and children != [] do
     active_children = Enum.reject(children, &ignored_child?/1)
 
@@ -303,10 +306,13 @@ defmodule SymphonyElixir.DeliveryRunner do
   defp child_id(%{"id" => id}) when is_binary(id), do: id
   defp child_id(_child), do: nil
 
-  defp child_branch(%{branch_name: branch}) when is_binary(branch) and branch != "", do: branch
-  defp child_branch(%{"branch_name" => branch}) when is_binary(branch) and branch != "", do: branch
-  defp child_branch(%{"branchName" => branch}) when is_binary(branch) and branch != "", do: branch
+  defp child_branch(%{branch_name: branch}) when is_binary(branch), do: usable_child_branch(branch)
+  defp child_branch(%{"branch_name" => branch}) when is_binary(branch), do: usable_child_branch(branch)
+  defp child_branch(%{"branchName" => branch}) when is_binary(branch), do: usable_child_branch(branch)
   defp child_branch(_child), do: nil
+
+  defp usable_child_branch("codex/" <> _ = branch), do: branch
+  defp usable_child_branch(_branch), do: nil
 
   defp ignored_child?(child) do
     child
