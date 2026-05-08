@@ -47,6 +47,44 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec ensure_labels([String.t()]) :: {:ok, map()} | {:error, term()}
+  def ensure_labels(label_names) when is_list(label_names) do
+    labels =
+      label_names
+      |> Enum.map(&to_string/1)
+      |> Enum.reject(&(String.trim(&1) == ""))
+      |> Map.new(fn label -> {label, "label-#{String.downcase(String.replace(label, " ", "-"))}"} end)
+
+    send_event({:memory_tracker_labels_ensured, Map.keys(labels)})
+    {:ok, labels}
+  end
+
+  @spec add_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def add_labels(issue_id, label_names) when is_binary(issue_id) and is_list(label_names) do
+    send_event({:memory_tracker_labels_added, issue_id, label_names})
+    :ok
+  end
+
+  @spec create_issue(map()) :: {:ok, Issue.t()} | {:error, term()}
+  def create_issue(attrs) when is_map(attrs) do
+    title = Map.get(attrs, :title) || Map.get(attrs, "title")
+    parent_id = Map.get(attrs, :parent_id) || Map.get(attrs, "parent_id")
+
+    issue = %Issue{
+      id: Map.get(attrs, :id) || Map.get(attrs, "id") || "memory-#{System.unique_integer([:positive])}",
+      identifier: Map.get(attrs, :identifier) || Map.get(attrs, "identifier") || "MT-#{System.unique_integer([:positive])}",
+      title: title,
+      description: Map.get(attrs, :description) || Map.get(attrs, "description"),
+      priority: Map.get(attrs, :priority) || Map.get(attrs, "priority"),
+      state: Map.get(attrs, :state) || Map.get(attrs, "state") || "Todo",
+      parent: if(is_binary(parent_id), do: %{id: parent_id}, else: nil),
+      labels: Map.get(attrs, :labels) || Map.get(attrs, "labels") || []
+    }
+
+    send_event({:memory_tracker_issue_created, issue})
+    {:ok, issue}
+  end
+
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end

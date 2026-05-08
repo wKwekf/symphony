@@ -108,7 +108,21 @@ Important boundary:
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
 
-8. `Logging`
+8. `Coordinator Runner` (OPTIONAL, implementation-defined)
+   - Handles parent issues labeled as epics/requirements.
+   - Creates worker child issues or asks clarification questions.
+   - Watches child issue readiness and invokes deterministic delivery.
+
+9. `Worker Runner`
+   - Executes child or direct worker issues in isolated workspaces.
+   - Produces implementation handoffs instead of product-review claims.
+
+10. `Delivery Runner` (OPTIONAL, implementation-defined)
+   - Integrates accepted child branches.
+   - Publishes a single parent PR/Preview handoff.
+   - MUST NOT deploy production unless explicitly allowed by workflow policy.
+
+11. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
 
 ### 3.2 Abstraction Levels
@@ -166,6 +180,10 @@ Fields:
 - `branch_name` (string or null)
   - Tracker-provided branch metadata if available.
 - `url` (string or null)
+- `parent` (object or null)
+  - Parent issue reference for child issues.
+- `children` (list)
+  - Sub-issue references for parent/coordinator issues.
 - `labels` (list of strings)
   - Normalized to lowercase.
 - `blocked_by` (list of blocker refs)
@@ -585,6 +603,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.max_continuation_retries`: integer, default `0`
+- `agent.max_total_tokens_per_issue`: integer, default `0` (disabled)
+- `agent.max_runtime_ms_per_issue`: integer, default `0` (disabled)
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -632,9 +653,12 @@ Important nuance:
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
-- Once the worker exits normally, the orchestrator still schedules a short continuation retry
-  (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+- Once the worker exits normally, the orchestrator MUST re-check the tracker state before deciding
+  what to do next.
+- If the issue is no longer active, the orchestrator releases the claim.
+- If the issue is still active after the in-worker turn loop is exhausted, the orchestrator MUST
+  respect `agent.max_continuation_retries`. When the limit is reached, it leaves a coordinator
+  handoff comment and moves the issue to a non-active review state instead of retrying forever.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -665,8 +689,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (normal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+  - Re-fetch the issue state.
+  - Release the claim if the issue is terminal, non-active, or missing.
+  - If the issue is still active, schedule at most `agent.max_continuation_retries` continuation
+    restarts. At the limit, stop automatic retries and hand off to the coordinator.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -675,6 +701,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 
 - `Codex Update Event`
   - Update live session fields, token counters, and rate limits.
+  - If configured token or runtime budgets are exceeded, stop the worker, leave a coordinator
+    handoff comment, move the issue to a non-active review state, and do not schedule a retry.
 
 - `Retry Timer Fired`
   - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
@@ -1871,10 +1899,22 @@ on_worker_exit(issue_id, reason, state):
 
   if reason == normal:
     state.completed.add(issue_id)  # bookkeeping only
-    state = schedule_retry(state, issue_id, 1, {
-      identifier: running_entry.identifier,
-      delay_type: continuation
-    })
+    issue = tracker.fetch_issue_states_by_ids([issue_id])
+
+    if issue is terminal, non-active, or missing:
+      state.claimed.remove(issue_id)
+      return state
+
+    if issue is active and continuation_count(issue_id) < config.agent.max_continuation_retries:
+      increment_continuation_count(issue_id)
+      state = schedule_retry(state, issue_id, 1, {
+        identifier: running_entry.identifier,
+        delay_type: continuation
+      })
+    else:
+      tracker.create_comment(issue_id, "Symphony Coordinator Required")
+      tracker.update_issue_state(issue_id, "In Review")
+      state.claimed.remove(issue_id)
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
       identifier: running_entry.identifier,
@@ -1985,7 +2025,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
+- Normal worker exit re-checks tracker state before release, continuation, or coordinator handoff
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error

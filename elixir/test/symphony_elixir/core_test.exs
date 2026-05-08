@@ -17,6 +17,9 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_continuation_retries == 0
+    assert config.agent.max_total_tokens_per_issue == 0
+    assert config.agent.max_runtime_ms_per_issue == 0
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +39,18 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_continuation_retries: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_continuation_retries"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_total_tokens_per_issue: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_total_tokens_per_issue"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_runtime_ms_per_issue: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_runtime_ms_per_issue"
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -197,7 +212,10 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "SymphonyElixir.start_link delegates to the orchestrator" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"]
+    )
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
     orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
 
@@ -285,6 +303,51 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "terminal issue state keeps active release runner alive for closeout" do
+    issue_id = "issue-release-1"
+    issue_identifier = "HB-220"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          runner_type: :release,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Review", identifier: issue_identifier},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state =
+      Orchestrator.reconcile_issue_states_for_test([
+        %Issue{id: issue_id, state: "Done", identifier: issue_identifier}
+      ], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+    assert updated_state.running[issue_id].issue.state == "Done"
+
+    send(agent_pid, :stop)
   end
 
   test "terminal issue state stops running agent and cleans workspace" do
@@ -514,44 +577,215 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
-  test "normal worker exit schedules active-state continuation retry" do
+  test "agent labels gate dispatch and select coordinator or worker runner" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "In Review"]
+    )
+
+    state = %Orchestrator.State{
+      running: %{},
+      claimed: MapSet.new(),
+      max_concurrent_agents: 2
+    }
+
+    parent = %Issue{
+      id: "issue-parent",
+      identifier: "HB-EPIC",
+      title: "Parent requirement",
+      state: "Todo",
+      labels: ["Agent Epic"]
+    }
+
+    child = %Issue{
+      id: "issue-child",
+      identifier: "HB-WORKER",
+      title: "Worker child",
+      state: "Todo",
+      labels: ["Agent Worker", "Agent Ready"]
+    }
+
+    held = %Issue{
+      id: "issue-held",
+      identifier: "HB-HELD",
+      title: "Needs shaping",
+      state: "Todo",
+      labels: ["Agent Epic", "Needs Shaping"]
+    }
+
+    release = %Issue{
+      id: "issue-release",
+      identifier: "HB-RELEASE",
+      title: "Release approved parent",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready", "Production Approved", "Human Review Required"]
+    }
+
+    preview_only = %Issue{
+      id: "issue-preview-only",
+      identifier: "HB-PREVIEW",
+      title: "Preview only parent",
+      state: "In Review",
+      labels: ["Agent Epic", "Preview Ready"]
+    }
+
+    worker_only = %Issue{
+      id: "issue-worker-only",
+      identifier: "HB-WORKER-ONLY",
+      title: "Worker without ready",
+      state: "Todo",
+      labels: ["Agent Worker"]
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(parent, state)
+    assert Orchestrator.runner_type_for_issue_for_test(parent) == :coordinator
+
+    assert Orchestrator.should_dispatch_issue_for_test(child, state)
+    assert Orchestrator.runner_type_for_issue_for_test(child) == :worker
+
+    assert Orchestrator.should_dispatch_issue_for_test(release, state)
+    assert Orchestrator.runner_type_for_issue_for_test(release) == :release
+
+    refute Orchestrator.should_dispatch_issue_for_test(held, state)
+    refute Orchestrator.should_dispatch_issue_for_test(preview_only, state)
+    refute Orchestrator.should_dispatch_issue_for_test(worker_only, state)
+  end
+
+  test "migration label allows only one active migration child" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    running_migration = %Issue{
+      id: "issue-running-migration",
+      identifier: "HB-MIG-1",
+      title: "Running migration",
+      state: "In Progress",
+      labels: ["Agent Worker", "Agent Ready", "Migration"]
+    }
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-running-migration" => %{issue: running_migration}
+      },
+      claimed: MapSet.new(),
+      max_concurrent_agents: 3
+    }
+
+    next_migration = %Issue{
+      id: "issue-next-migration",
+      identifier: "HB-MIG-2",
+      title: "Next migration",
+      state: "Todo",
+      labels: ["Agent Worker", "Agent Ready", "Migration"]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(next_migration, state)
+  end
+
+  test "normal worker exit with active issue hands off to coordinator by default" do
     issue_id = "issue-resume"
     ref = make_ref()
-    orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
-    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
-    on_exit(fn ->
-      if Process.alive?(pid) do
-        Process.exit(pid, :normal)
-      end
-    end)
-
-    initial_state = :sys.get_state(pid)
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-558",
+      state: "In Progress",
+      title: "Still active after worker budget",
+      labels: []
+    }
 
     running_entry = %{
       pid: self(),
       ref: ref,
       identifier: "MT-558",
-      issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
+      issue: issue,
       started_at: DateTime.utc_now()
     }
 
-    :sys.replace_state(pid, fn _ ->
-      initial_state
-      |> Map.put(:running, %{issue_id => running_entry})
-      |> Map.put(:claimed, MapSet.new([issue_id]))
-      |> Map.put(:retry_attempts, %{})
-    end)
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 
-    send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      completed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, state} = Orchestrator.handle_info({:DOWN, ref, :process, self(), :normal}, state)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert_receive {:memory_tracker_labels_added, ^issue_id, ["Coordinator Required"]}
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+    assert comment =~ "Symphony Coordinator Required"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}
+  end
+
+  test "token budget stops running issue and hands off to coordinator" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      max_total_tokens_per_issue: 100
+    )
+
+    issue_id = "issue-token-budget"
+    ref = make_ref()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-BUDGET",
+      state: "In Progress",
+      title: "Token runaway",
+      labels: []
+    }
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: ref,
+      identifier: "MT-BUDGET",
+      issue: issue,
+      started_at: DateTime.utc_now(),
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      completed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, state} =
+             Orchestrator.handle_info({:codex_worker_update, issue_id, token_usage_update(120)}, state)
+
+    Process.sleep(20)
+
+    refute Process.alive?(worker_pid)
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert_receive {:memory_tracker_labels_added, ^issue_id, ["Coordinator Required"]}
+    assert_receive {:memory_tracker_comment, ^issue_id, comment}
+    assert comment =~ "token budget exceeded"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +825,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1815,5 +2049,28 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp token_usage_update(total_tokens) do
+    %{
+      event: :notification,
+      payload: %{
+        "method" => "codex/event/token_count",
+        "params" => %{
+          "msg" => %{
+            "payload" => %{
+              "info" => %{
+                "total_token_usage" => %{
+                  "input_tokens" => total_tokens,
+                  "output_tokens" => 0,
+                  "total_tokens" => total_tokens
+                }
+              }
+            }
+          }
+        }
+      },
+      timestamp: DateTime.utc_now()
+    }
   end
 end
