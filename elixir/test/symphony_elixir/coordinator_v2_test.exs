@@ -47,6 +47,45 @@ defmodule SymphonyElixir.CoordinatorV2Test do
     assert plan.delivery.review_surface =~ "Vercel Preview"
   end
 
+  test "review instructions mentioning preview do not trigger preview environment plan" do
+    issue = %Issue{
+      id: "parent-submission-slug",
+      identifier: "HB-206",
+      title: "[HB-FRONTEND] show agent reference slug on submission detail",
+      labels: ["Agent Epic", "Frontend", "MVP", "Feature"],
+      description: """
+      ## Context
+
+      Daniel wants a stable agent reference slug in the Submission Detail view.
+
+      ## Problem
+
+      Agents need a concise way to identify the exact submission.
+
+      ## Scope
+
+      Show a copyable agent reference near the top of the Submission Detail view.
+
+      ## Acceptance Criteria
+
+      - The parent handoff includes a Vercel Preview URL, persona to use, and exact review steps.
+
+      ## Test Plan
+
+      1. Open the Vercel Preview URL.
+      2. Use `/dev/personas` and choose the Staff persona.
+      """
+    }
+
+    assert {:ok, plan} = CoordinatorPlan.from_issue(issue)
+
+    assert plan.mode == "single-worker"
+    assert [child] = plan.children
+    refute String.contains?(child.title, "preview seed command")
+    refute String.contains?(child.scope, "Own only the preview persona seeding path")
+    assert child.ownership_area == "Frontend"
+  end
+
   test "coordinator creates agent-ready child issues for a parent epic" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())

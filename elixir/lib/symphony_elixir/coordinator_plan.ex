@@ -423,14 +423,24 @@ defmodule SymphonyElixir.CoordinatorPlan do
   end
 
   defp preview_environment_issue?(%Issue{} = issue) do
-    body = issue_body(issue)
+    body = primary_issue_body(issue)
 
     String.contains?(body, "preview") and
       Enum.any?(["seed", "persona", "supabase", "vercel", "environment", "umgebung"], &String.contains?(body, &1))
   end
 
-  defp issue_body(%Issue{} = issue) do
-    "#{issue.title || ""}\n#{issue.description || ""}"
+  defp primary_issue_body(%Issue{} = issue) do
+    title = issue.title || ""
+    description = issue.description || ""
+
+    primary_description =
+      description
+      |> String.split(~r/\n##\s+(Acceptance Criteria|Test Plan|Risks|Rollback|Dependencies|Review|Worker Contract)\b/i,
+        parts: 2
+      )
+      |> List.first()
+
+    "#{title}\n#{primary_description || ""}"
     |> String.downcase()
   end
 
