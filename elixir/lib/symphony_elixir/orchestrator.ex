@@ -354,6 +354,11 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
+      terminal_issue_state?(issue.state, terminal_states) and active_release_runner?(state, issue.id) ->
+        Logger.info("Issue moved to terminal state while release runner is active: #{issue_context(issue)} state=#{issue.state}; allowing release closeout")
+
+        refresh_running_issue_state(state, issue)
+
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
@@ -375,6 +380,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp active_release_runner?(%State{} = state, issue_id) when is_binary(issue_id) do
+    match?(%{runner_type: :release}, Map.get(state.running, issue_id))
+  end
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do

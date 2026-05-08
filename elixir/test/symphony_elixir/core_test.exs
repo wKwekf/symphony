@@ -305,6 +305,51 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "terminal issue state keeps active release runner alive for closeout" do
+    issue_id = "issue-release-1"
+    issue_identifier = "HB-220"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          runner_type: :release,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Review", identifier: issue_identifier},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    updated_state =
+      Orchestrator.reconcile_issue_states_for_test([
+        %Issue{id: issue_id, state: "Done", identifier: issue_identifier}
+      ], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert Process.alive?(agent_pid)
+    assert updated_state.running[issue_id].issue.state == "Done"
+
+    send(agent_pid, :stop)
+  end
+
   test "terminal issue state stops running agent and cleans workspace" do
     test_root =
       Path.join(
