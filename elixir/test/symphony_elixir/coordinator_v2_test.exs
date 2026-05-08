@@ -154,6 +154,61 @@ defmodule SymphonyElixir.CoordinatorV2Test do
     refute_receive {:memory_tracker_comment, "parent-ignore", _comment}, 50
   end
 
+  test "coordinator regenerates child issues when previous split children are canceled" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{
+        id: "child-preview-seed",
+        identifier: "HB-207",
+        title: "Canceled wrong child",
+        state: "Canceled",
+        labels: ["Agent Worker", "Agent Ready"]
+      },
+      %Issue{
+        id: "child-preview-docs",
+        identifier: "HB-208",
+        title: "Canceled wrong child",
+        state: "Canceled",
+        labels: ["Agent Worker", "Agent Ready"]
+      }
+    ])
+
+    parent = %Issue{
+      id: "parent-regenerate",
+      identifier: "HB-206",
+      title: "[HB-FRONTEND] show agent reference slug on submission detail",
+      description: """
+      ## Context
+
+      Daniel wants a stable agent reference slug in the Submission Detail view.
+
+      ## Scope
+
+      Show a copyable agent reference near the top of the Submission Detail view.
+
+      ## Test Plan
+
+      Open the Vercel Preview URL and review with seeded personas.
+      """,
+      state: "Todo",
+      labels: ["Agent Epic", "Frontend"],
+      children: [%{id: "child-preview-seed"}, %{id: "child-preview-docs"}]
+    }
+
+    assert :ok = CoordinatorRunner.run(parent)
+
+    assert_receive {:memory_tracker_labels_ensured, _labels}
+    assert_receive {:memory_tracker_state_update, "parent-regenerate", "In Progress"}
+    assert_receive {:memory_tracker_issue_created, %Issue{} = child}
+    assert child.parent == %{id: "parent-regenerate"}
+    assert child.title =~ "HB-206 worker"
+    refute String.contains?(child.title, "preview seed command")
+    assert "Agent Worker" in child.labels
+    assert "Agent Ready" in child.labels
+  end
+
   test "clarification plan adds needs shaping and stops" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())

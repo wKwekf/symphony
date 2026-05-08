@@ -47,6 +47,10 @@ defmodule SymphonyElixir.CoordinatorRunner do
           Logger.info("CoordinatorRunner waiting for Linear child visibility on #{issue.identifier || issue.id}")
           :ok
 
+        only_ignored_children?(issue) ->
+          Logger.info("CoordinatorRunner regenerating children for #{issue.identifier || issue.id}; existing children are canceled/ignored")
+          shape_or_create_children(issue)
+
         blocked_children?(issue) ->
           block_parent(issue, "One or more child issues are blocked or marked Coordinator Required: #{blocked_child_summary(issue)}")
 
@@ -252,6 +256,18 @@ defmodule SymphonyElixir.CoordinatorRunner do
   defp active_child_issues(child_issues) when is_list(child_issues) do
     Enum.reject(child_issues, &ignored_child?/1)
   end
+
+  defp only_ignored_children?(%Issue{children: children}) when is_list(children) and children != [] do
+    case fetch_child_issues(children) do
+      {:ok, child_issues} when child_issues != [] ->
+        active_child_issues(child_issues) == []
+
+      _ ->
+        false
+    end
+  end
+
+  defp only_ignored_children?(_issue), do: false
 
   defp ignored_child?(%Issue{state: state}) when is_binary(state) do
     normalize(state) in ["canceled", "cancelled", "duplicate"]
